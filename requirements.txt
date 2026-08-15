@@ -1,0 +1,6 @@
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+colorama>=0.4.6,<1
+scrapy>=2.11,<3
+dnspython>=2.6,<3
+tldextract>=5.1,<6

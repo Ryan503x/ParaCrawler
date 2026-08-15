@@ -1,24 +1,26 @@
 import csv
-import re
-import time
-import random
-import threading
-import sys
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from optparse import OptionParser
-from urllib.parse import urlparse, urljoin, parse_qsl, unquote
-from urllib3.exceptions import InsecureRequestWarning
-import requests
-from bs4 import BeautifulSoup
-import warnings
-from bs4 import XMLParsedAsHTMLWarning
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-from colorama import Fore, Style, init
-import socket
 import json
+import math
+import random
+import re
+import sys
+import threading
+import time
+import warnings
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from optparse import OptionParser
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+
+import requests
+import tldextract
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from colorama import Fore, Style, init
 from scrapy.http import TextResponse
 from scrapy.linkextractors import LinkExtractor
+from urllib3.exceptions import InsecureRequestWarning
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # Import DNS resolver with fallback
 try:
@@ -54,6 +56,24 @@ init(autoreset=True)
 
 # Disable SSL warnings
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# Use the bundled Public Suffix List snapshot; never make a network request here.
+TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
+
+
+def print_color_legend():
+    """Print the result color legend once at startup."""
+    print("\nResult color legend:")
+    print(Fore.LIGHTMAGENTA_EX + "  Query parameters" + Style.RESET_ALL)
+    print(Fore.LIGHTBLUE_EX + "  HTML inputs" + Style.RESET_ALL)
+    print(Fore.YELLOW + "  JavaScript inputs" + Style.RESET_ALL)
+    print(Fore.GREEN + "  Buttons" + Style.RESET_ALL)
+    print(Fore.LIGHTBLACK_EX + "  Hidden fields" + Style.RESET_ALL)
+    print(Fore.RED + "  Sensitive findings" + Style.RESET_ALL)
+    print(Fore.LIGHTMAGENTA_EX + "  Versions" + Style.RESET_ALL)
+    print(Fore.CYAN + "  IP addresses" + Style.RESET_ALL)
+    print()
+
 
 # Sensitive keywords to look for in comments
 SENSITIVE_KEYWORDS = [
@@ -105,9 +125,7 @@ def is_sensitive(text):
         return False
 
     if INPUT_FIELD_PATTERN.search(text):
-        if INPUT_FIELD_WITH_VALUE_PATTERN.search(text):
-            return True
-        return False
+        return bool(INPUT_FIELD_WITH_VALUE_PATTERN.search(text))
 
     # Check for sensitive pattern
     match = SENSITIVE_PATTERN.search(text)
@@ -151,7 +169,7 @@ def get_query_params(url):
                     params.append(f"{key}={value}")
             else:
                 params.append(key)
-    except Exception as e:
+    except Exception:
         # Fallback: try to extract manually if parse_qsl fails
         try:
             query_parts = parsed.query.split('&')
@@ -207,7 +225,17 @@ def get_user_input_with_timeout(timeout=10):
 
 # ------------------- FIXED CRAWLER CODE ------------------- #
 class AdvancedCrawler:
-    def __init__(self, max_workers=10, delay_range=(0.5, 1.0), crawl_subdomains=False, debug=False):
+    def __init__(
+        self,
+        max_workers=10,
+        delay_range=(0.1, 0.1),
+        crawl_subdomains=False,
+        debug=False,
+        request_timeout=10.0,
+        max_response_bytes=1048576,
+        request_retries=1,
+        https_fallback=True,
+    ):
         self.visited = set()
         self.to_visit = deque()
         self.lock = threading.Lock()
@@ -217,36 +245,46 @@ class AdvancedCrawler:
         self.timeout_urls = set()  # URLs that timed out
         self.base_domain = ""
         self.domain_ip = None  # Store resolved IP
-        self.max_workers = max_workers
+        self.max_workers = max(1, int(max_workers))
         self.delay_range = delay_range
+        self.request_timeout = max(0.1, float(request_timeout))
+        self.max_response_bytes = max(1024, int(max_response_bytes))
+        self.request_retries = max(1, int(request_retries))
+        self.https_fallback = bool(https_fallback)
         self.crawled_count = 0
         self.found_files = set()
         self.crawl_subdomains = crawl_subdomains
         self.debug = debug
         
-        # Create session with proper headers
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        self._thread_local = threading.local()
+
+    def _create_session(self):
+        """Create a configured HTTP session for one worker thread."""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'ParaCrawler/1.0 (+https://github.com/Ryan503x/ParaCrawler)',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
         })
-        self.session.verify = False
-        
-        # Disable SSL warnings for this session
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        # Configure session for better performance
+        session.verify = False
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=50,
-            pool_maxsize=50,
-            max_retries=1
+            pool_connections=self.max_workers,
+            pool_maxsize=self.max_workers,
+            # ParaCrawler owns retry policy through --retries. Keeping adapter
+            # retries disabled prevents each attempt from silently doubling.
+            max_retries=0,
+            pool_block=True,
         )
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
+
+    def get_session(self):
+        """Return a thread-local session to avoid sharing mutable session state."""
+        if not hasattr(self._thread_local, 'session'):
+            self._thread_local.session = self._create_session()
+        return self._thread_local.session
 
     def pre_resolve_dns(self, domain):
         """Pre-resolve DNS to avoid lookup overhead"""
@@ -260,67 +298,71 @@ class AdvancedCrawler:
             pass
 
     def is_same_domain(self, target_url):
-        """Check if target_url shares the same root domain - FIXED AND IMPROVED"""
+        """Return whether a URL is inside the configured crawl scope."""
         try:
-            target_domain = urlparse(target_url).netloc.lower()
-            base_domain = self.base_domain.lower()
-            
-            # Handle empty domains
-            if not target_domain or not base_domain:
+            target_host = (urlparse(target_url).hostname or '').lower().rstrip('.')
+            base_host = (urlparse(f'//{self.base_domain}').hostname or '').lower().rstrip('.')
+            if not target_host or not base_host:
                 return False
-            
-            # If subdomain crawling is disabled, only allow exact domain matches
+
             if not self.crawl_subdomains:
-                # Exact match only (no subdomains)
-                return target_domain == base_domain
-            
-            # Extract root domain (get last two parts for most cases)
-            def get_root_domain(domain):
-                parts = domain.split('.')
-                if len(parts) >= 2:
-                    # For domains like testphp.vulnweb.com -> vulnweb.com
-                    # For domains like example.co.uk -> example.co.uk
-                    if len(parts) > 2 and parts[-2] in ['co', 'com', 'org', 'net', 'gov', 'edu']:
-                        return '.'.join(parts[-3:])
-                    return '.'.join(parts[-2:])
-                return domain
-            
-            base_root = get_root_domain(base_domain)
-            target_root = get_root_domain(target_domain)
-            
-            # Check if they share the same root domain
-            if base_root == target_root:
-                return True
-                
-            # Additional check: if base domain is a subdomain of target or vice versa
-            if target_domain.endswith('.' + base_root) or base_domain.endswith('.' + target_root):
-                return True
-                
-            return False
-        except Exception as e:
+                # Treat the conventional apex/www pair as the same site. Many
+                # sites immediately redirect from one form to the other, and
+                # rejecting that redirect prevents the first page from loading.
+                def without_www(host):
+                    return host[4:] if host.startswith('www.') else host
+
+                return (
+                    target_host == base_host
+                    or without_www(target_host) == without_www(base_host)
+                    and (target_host.startswith('www.') or base_host.startswith('www.'))
+                )
+
+            base_parts = TLD_EXTRACTOR(base_host)
+            target_parts = TLD_EXTRACTOR(target_host)
+            if base_parts.suffix and target_parts.suffix:
+                return (
+                    base_parts.top_domain_under_public_suffix
+                    == target_parts.top_domain_under_public_suffix
+                )
+
+            # For private/internal names with no known public suffix, only permit
+            # the exact host and its descendants; never guess sibling scope.
+            return target_host.endswith(f'.{base_host}')
+        except (TypeError, ValueError, AttributeError) as error:
             if self.debug:
-                print(f"[DEBUG] Domain check error for {target_url}: {e}")
+                print(f"[DEBUG] Domain check error for {target_url}: {error}")
             return False
 
     def normalize_url(self, url):
-        """Normalize URL by removing fragments and standardizing - IMPROVED"""
+        """Return a stable HTTP(S) URL to reduce duplicate crawl work."""
         try:
-            # Ensure URL has scheme
-            if not url.startswith(('http://', 'https://')):
-                url = 'http://' + url
-                
-            parsed = urlparse(url)
-            
-            # Add trailing slash to base domain URLs
-            path = parsed.path
-            if not path and parsed.netloc:
-                path = "/"
-            
-            normalized = f"{parsed.scheme}://{parsed.netloc}{path}"
+            candidate = url.strip()
+            if '://' not in candidate:
+                candidate = 'http://' + candidate
+
+            parsed = urlparse(candidate)
+            scheme = parsed.scheme.lower()
+            if scheme not in ('http', 'https') or not parsed.hostname:
+                return url
+
+            host = parsed.hostname.lower().rstrip('.')
+            if ':' in host and not host.startswith('['):
+                host = f'[{host}]'
+
+            port = parsed.port
+            if port and not ((scheme == 'http' and port == 80) or (scheme == 'https' and port == 443)):
+                host = f'{host}:{port}'
+
+            path = re.sub(r'/+', '/', parsed.path or '/')
+            if path != '/' and path.endswith('/'):
+                path = path.rstrip('/')
+
+            normalized = f'{scheme}://{host}{path}'
             if parsed.query:
-                normalized += f"?{parsed.query}"
+                normalized += f'?{parsed.query}'
             return normalized
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
             return url
 
     def is_non_html_resource(self, url):
@@ -340,8 +382,45 @@ class AdvancedCrawler:
         """Return True for CSS files that should be excluded from found files."""
         return url.lower().endswith('.css')
 
-    def fetch_url_content(self, url, retries=2, timeout=(5, 10)):
-        """Fetch URL content with retries and store it - IMPROVED"""
+    def _request_with_safe_redirects(self, url, timeout, method='GET', max_redirects=5):
+        """Follow only in-scope redirects and return the final response."""
+        session = self.get_session()
+        current_url = url
+        redirect_codes = {301, 302, 303, 307, 308}
+        request = getattr(session, method.lower())
+
+        for _ in range(max_redirects + 1):
+            request_options = {
+                'timeout': timeout,
+                'allow_redirects': False,
+            }
+            if method.upper() == 'GET':
+                request_options['stream'] = True
+            response = request(current_url, **request_options)
+            if response.status_code not in redirect_codes:
+                return response, current_url, True
+
+            location = response.headers.get('Location')
+            if not location:
+                return response, current_url, False
+
+            next_url = self.normalize_url(urljoin(current_url, location))
+            if not self.is_same_domain(next_url):
+                return response, current_url, False
+
+            response.close()
+            current_url = next_url
+
+        raise requests.exceptions.TooManyRedirects(
+            f"More than {max_redirects} redirects for {url}"
+        )
+
+    def fetch_url_content(self, url, retries=None, timeout=None):
+        """Fetch and retain a bounded HTML response with retries."""
+        if retries is None:
+            retries = self.request_retries
+        if timeout is None:
+            timeout = (min(5.0, self.request_timeout), self.request_timeout)
         # Check if this is a non-HTML resource before fetching
         if self.is_non_html_resource(url):
             with self.lock:
@@ -351,26 +430,21 @@ class AdvancedCrawler:
             return None
 
         for attempt in range(retries):
+            response = None
             try:
                 time.sleep(random.uniform(*self.delay_range))
-                
-                response = self.session.get(
-                    url, 
-                    timeout=timeout,
-                    allow_redirects=True,
-                    stream=True
-                )
-                
-                # record status for any response
+
+                response, final_url, redirect_allowed = self._request_with_safe_redirects(url, timeout)
+
+                # Record both the requested URL and the final in-scope URL.
                 with self.lock:
                     self.url_status[url] = response.status_code
+                    self.url_status[final_url] = response.status_code
 
-                # Track redirects and update URL status for final URL
-                if response.history:
-                    redirect_chain = [r.url for r in response.history] + [response.url]
-                    # Update status for the final URL after redirects
-                    with self.lock:
-                        self.url_status[response.url] = response.status_code
+                if not redirect_allowed:
+                    if self.debug:
+                        print(f"[DEBUG] Blocked out-of-scope or invalid redirect from {url}")
+                    return None
 
                 if response.status_code == 404:
                     with self.lock:
@@ -387,9 +461,8 @@ class AdvancedCrawler:
                         self.crawled_count += 1
                     return None
                 
-                content = response.raw.read(1048576, decode_content=True)
-                response.close()
-                
+                content = response.raw.read(self.max_response_bytes, decode_content=True)
+
                 try:
                     html = content.decode('utf-8')
                 except UnicodeDecodeError:
@@ -423,7 +496,10 @@ class AdvancedCrawler:
                 if attempt == retries - 1:
                     with self.lock:
                         self.failed_urls.add(url)
-        
+            finally:
+                if response is not None:
+                    response.close()
+
         return None
 
     def debug_extract_links(self, html, base_url):
@@ -458,7 +534,7 @@ class AdvancedCrawler:
 
     def extract_links(self, html, base_url):
         """Extract all links from HTML content using Scrapy's LinkExtractor"""
-        extractor = LinkExtractor(allow_domains=[self.base_domain])
+        extractor = LinkExtractor()
         response = TextResponse(url=base_url, body=html, encoding='utf-8')
         return [link.url for link in extractor.extract_links(response)]
 
@@ -505,7 +581,7 @@ class AdvancedCrawler:
                             continue
             
             # Convert to list and sort
-            subdomains = sorted(list(found_subdomains))
+            subdomains = sorted(found_subdomains)
             
             # Print discovered subdomains only when debugging
             if self.debug and subdomains:
@@ -519,66 +595,20 @@ class AdvancedCrawler:
         return subdomains
 
     def discover_sveltekit_routes(self, html, base_url):
-        """Discover SvelteKit specific routes and endpoints"""
-        sveltekit_routes = set()
-        
-        # Common SvelteKit patterns
-        patterns = [
-            r'/_app/immutable/(.*?)\.js',
-            r'/_api/([^"\'\s]+)',
-            r'/api/([^"\'\s]+)',
-            r'/([a-zA-Z0-9-_]+)/?\[([^]]+)\]',  # Dynamic routes like /blog/[slug]
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, html)
-            for match in matches:
-                if isinstance(match, tuple):
-                    # Handle tuple matches (like from dynamic routes)
-                    route_parts = [part for part in match if part]
-                    if route_parts:
-                        route = '/' + '/'.join(route_parts)
-                else:
-                    route = '/' + match if not match.startswith('/') else match
-                
-                try:
-                    full_url = urljoin(base_url, route)
-                    if self.is_same_domain(full_url):
-                        sveltekit_routes.add(full_url)
-                except Exception:
-                    continue
-        
-        return list(sveltekit_routes)
+        """Discover explicit SvelteKit assets and API paths without guessing routes."""
+        routes = set()
+        patterns = (
+            r'["\'](/_app/immutable/[^"\']+\.js(?:\?[^"\']*)?)["\']',
+            r'["\'](/_?api(?:/[^"\']*)?)["\']',
+        )
 
-    def try_common_sveltekit_endpoints(self, base_url):
-        """Try common SvelteKit endpoints that might not be linked"""
-        common_endpoints = [
-            "/api",
-            "/_api",
-            "/_app",
-            "/auth",
-            "/login", 
-            "/register",
-            "/dashboard",
-            "/admin",
-            "/user",
-            "/profile",
-            "/settings",
-            "/blog",
-            "/posts",
-            "/products",
-            "/api/auth",
-            "/api/users",
-            "/api/posts",
-        ]
-        
-        endpoints_to_try = []
-        for endpoint in common_endpoints:
-            full_url = urljoin(base_url, endpoint)
-            if self.is_same_domain(full_url):
-                endpoints_to_try.append(full_url)
-        
-        return endpoints_to_try
+        for pattern in patterns:
+            for path in re.findall(pattern, html, re.IGNORECASE):
+                full_url = self.normalize_url(urljoin(base_url, path))
+                if self.is_same_domain(full_url):
+                    routes.add(full_url)
+
+        return sorted(routes)
 
     def crawl_worker(self, url):
         """Worker function for crawling URLs - FIXED FOR SUBDOMAIN RECURSION"""
@@ -593,10 +623,24 @@ class AdvancedCrawler:
         
         # Fetch content once and store it
         html = self.fetch_url_content(url)
+        if not html and self.https_fallback and urlparse(url).scheme == 'http':
+            https_url = self.normalize_url(url.replace('http://', 'https://', 1))
+            if self.is_same_domain(https_url):
+                if self.debug:
+                    print(f"[DEBUG] HTTP failed; trying HTTPS fallback: {https_url}")
+                html = self.fetch_url_content(https_url)
+                if html:
+                    with self.lock:
+                        self.visited.add(https_url)
+                        self.timeout_urls.discard(url)
+                        self.failed_urls.discard(url)
+                    url = https_url
+
         if not html:
-            # If we have a status and it's not 404, still consider visited for printing
+            # Only yield a successfully fetched non-HTML response. A blocked
+            # redirect retains its 3xx status for diagnostics but was not crawled.
             status = self.url_status.get(url)
-            if status and status != 404:
+            if status and 200 <= status < 300:
                 return url, []
             return None, []
         
@@ -625,13 +669,12 @@ class AdvancedCrawler:
         
         new_links = []
         with self.lock:
-            for link in links:
-                # DOUBLE SECURITY CHECK: Ensure link is from same domain before adding
+            for raw_link in links:
+                link = self.normalize_url(raw_link)
                 if self.is_same_domain(link) and link not in self.visited and link not in self.to_visit:
                     self.to_visit.append(link)
                     new_links.append(link)
                 elif link not in self.visited and link not in self.to_visit:
-                    # Debug: Show why link was rejected
                     if self.debug:
                         parsed = urlparse(link)
                         print(f"[DEBUG] Rejected link (domain mismatch): {link} (domain: {parsed.netloc}, base: {self.base_domain})")
@@ -651,7 +694,11 @@ class AdvancedCrawler:
             
         start_url = self.normalize_url(start_url)
         parsed = urlparse(start_url)
-        self.base_domain = parsed.netloc.lower()
+        self.base_domain = (parsed.hostname or '').lower()
+        extracted_domain = TLD_EXTRACTOR(self.base_domain)
+        self.root_domain = (
+            extracted_domain.top_domain_under_public_suffix or self.base_domain
+        )
         
         # SECURITY CHECK: Validate the base domain
         if not self.base_domain or '.' not in self.base_domain:
@@ -659,15 +706,7 @@ class AdvancedCrawler:
             return
         
         self.to_visit.append(start_url)
-        
-        # ENHANCED: Add common SvelteKit endpoints to try
-        common_endpoints = self.try_common_sveltekit_endpoints(start_url)
-        for endpoint in common_endpoints:
-            if endpoint not in self.visited and endpoint not in self.to_visit:
-                self.to_visit.append(endpoint)
-                if self.debug:
-                    print(f"[DEBUG] Added common endpoint to queue: {endpoint}")
-        
+
         # Pre-resolve DNS
         self.pre_resolve_dns(self.base_domain)
         
@@ -681,21 +720,27 @@ class AdvancedCrawler:
             print(f"Starting crawl of {start_url} (max: {max_urls} URLs)")
         else:
             print(f"Starting crawl of {start_url}")
-        print(f"[INFO] Root domain: {self.base_domain}")
+        print(f"[INFO] Root domain: {self.root_domain}")
         print("-"*50)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            while self.to_visit and (max_urls is None or self.crawled_count < max_urls):
+            while self.to_visit and (max_urls is None or len(self.visited) < max_urls):
                 # Debug: Show queue status
                 if self.debug:
                     print(f"[DEBUG] URLs in queue: {len(self.to_visit)}, Visited: {len(self.visited)}, Crawled: {self.crawled_count}")
-                
-                # Get batch of URLs to process (sorted for consistency)
+
+                # Count submitted/visited work, not only successful responses, so
+                # failures and non-HTML resources consume the strict URL limit.
+                batch_capacity = self.max_workers * 2
+                if max_urls is not None:
+                    batch_capacity = min(batch_capacity, max_urls - len(self.visited))
+                batch_capacity = min(batch_capacity, len(self.to_visit))
+
                 batch_urls = []
-                for _ in range(min(self.max_workers * 2, len(self.to_visit))):  # Process more URLs per batch
+                for _ in range(max(0, batch_capacity)):
                     try:
                         url = self.to_visit.popleft()
-                        if url not in self.visited:  # Double-check not visited
+                        if url not in self.visited:
                             batch_urls.append(url)
                     except IndexError:
                         break
@@ -709,18 +754,16 @@ class AdvancedCrawler:
                 
                 # Submit all URLs in batch
                 futures = [executor.submit(self.crawl_worker, url) for url in batch_urls]
-                
-                # Wait for all to complete and process results
-                for future in futures:
+
+                # Consume completed work immediately instead of blocking on submission order.
+                for future in as_completed(futures):
                     try:
-                        url, new_links = future.result(timeout=15)
+                        url, _new_links = future.result()
                         if url:
                             yield url
-                    except Exception:
-                        continue
-        
-        # Retry timeout URLs if any
-        self.retry_timeout_urls()
+                    except Exception as error:
+                        if self.debug:
+                            print(f"[DEBUG] Worker error: {error}")
         
         # Visit found files to get their status codes
         self.visit_found_files()
@@ -749,17 +792,28 @@ class AdvancedCrawler:
                         self.url_status[file_url] = "ERROR"
 
     def check_file_status(self, url):
-        """Check the status code of a file URL"""
+        """Check a file status without following redirects outside scope."""
+        timeout = (5, 10)
+        response = None
         try:
-            response = self.session.head(url, timeout=(5, 10), allow_redirects=True)
-            return response.status_code
-        except Exception:
+            response, _final_url, allowed = self._request_with_safe_redirects(
+                url, timeout, method='HEAD'
+            )
+            return response.status_code if allowed else None
+        except requests.exceptions.RequestException:
+            if response is not None:
+                response.close()
+                response = None
             try:
-                # If HEAD fails, try GET
-                response = self.session.get(url, timeout=(5, 10), allow_redirects=True)
-                return response.status_code
-            except Exception:
+                response, _final_url, allowed = self._request_with_safe_redirects(
+                    url, timeout, method='GET'
+                )
+                return response.status_code if allowed else None
+            except requests.exceptions.RequestException:
                 return None
+        finally:
+            if response is not None:
+                response.close()
 
     def retry_timeout_urls(self):
         """Keep retrying timeout URLs until all are processed or max attempts reached"""
@@ -774,7 +828,7 @@ class AdvancedCrawler:
             retry_count[url] = 0
         
         while self.timeout_urls and max(retry_count.values()) < max_retry_attempts:
-            retry_urls = sorted(list(self.timeout_urls))  # Sort for consistent retry order
+            retry_urls = sorted(self.timeout_urls)  # Sort for consistent retry order
             self.timeout_urls.clear()
             
             if retry_urls:
@@ -812,7 +866,7 @@ class AdvancedCrawler:
         if not self.failed_urls:
             return
         
-        retry_urls = sorted(list(self.failed_urls))  # Sort for consistent retry order
+        retry_urls = sorted(self.failed_urls)  # Sort for consistent retry order
         self.failed_urls.clear()
         
         if retry_urls:        
@@ -831,7 +885,7 @@ class AdvancedCrawler:
                         html = future.result(timeout=10)
                         if html:
                             # Process the retried URL
-                            ep = Endpoint(url, html)
+                            ep = Endpoint(url, html, debug=self.debug)
                             ep.fetch_parameters()
                             ep.fetch_comments()
                             endpoints_list.append(ep)  # Add to live endpoints list
@@ -878,11 +932,12 @@ class AdvancedCrawler:
                         continue
 
 
-# ------------------- ENDPOINT CODE (COMPLETELY UNCHANGED) ------------------- #
+# ------------------- ENDPOINT ANALYSIS ------------------- #
 class Endpoint:
-    def __init__(self, url, html_content):
+    def __init__(self, url, html_content, debug=False):
         self.url = url
-        self.html_content = html_content  # Store HTML content
+        self.html_content = html_content or ""
+        self.debug = debug
         # HTML and JavaScript inputs
         self.html_inputs = []   # Inputs/selects/textareas inside <form> (HTML inputs)
         self.js_inputs = []     # Inputs/selects/textareas outside <form> (likely JS-driven inputs)
@@ -899,17 +954,6 @@ class Endpoint:
         self.sensitive_comments = []  # Comments with sensitive keywords
         self.sensitive_matches = []   # Exact sensitive phrases matched
         self.comment_type = ""
-        
-        # Create session for additional requests if needed
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.session.verify = False
-        
-        # Disable SSL warnings for this session
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def fetch_parameters(self):
         """Fetch form parameters from stored HTML content"""
@@ -918,7 +962,7 @@ class Endpoint:
             self._extract_forms_buttons_hidden_fallback()
             self._remove_duplicates()
             return self.parameters + self.buttons + self.hidden_params
-        except Exception as e:
+        except Exception:
             return []
 
     def _extract_forms_buttons_hidden_fallback(self):
@@ -1095,96 +1139,70 @@ class Endpoint:
         self.placeholder = list(dict.fromkeys(self.placeholder))
 
     def fetch_comments(self):
-        """Fetch comments from stored HTML content"""
+        """Extract comments, sensitive values, versions, and IPv4 indicators."""
         self.comments = []
         self.sensitive_comments = []
         self.sensitive_matches = []
         self.version_matches = []
         self.ip_matches = []
         self.has_comment = False
-        html_comments = []
-        js_comments = []
+        self.comment_type = ""
 
         try:
-            # Extract HTML comments
-            html_comments = re.findall(r'<!--(.*?)-->', self.html_content, re.DOTALL)
-            # Extract JS comments
-            js_comments = re.findall(r'//.*?$|/\*.*?\*/', self.html_content, re.DOTALL | re.MULTILINE)
+            html_comments = [
+                comment.strip()
+                for comment in re.findall(r'<!--(.*?)-->', self.html_content, re.DOTALL)
+                if comment.strip()
+            ]
+            js_comments = [
+                comment.strip()
+                for comment in re.findall(r'//.*?$|/\*.*?\*/', self.html_content, re.DOTALL | re.MULTILINE)
+                if comment.strip()
+            ]
+            self.comments = html_comments + js_comments
+            self.has_comment = bool(self.comments)
 
-            html_comments = [c.strip() for c in html_comments if c.strip()]
-            js_comments = [c.strip() for c in js_comments if c.strip()]
+            if html_comments and js_comments:
+                self.comment_type = "Has HTML + JS Comment"
+            elif html_comments:
+                self.comment_type = "Has HTML Comment"
+            elif js_comments:
+                self.comment_type = "Has JS Comment"
 
-            if html_comments or js_comments:
-                self.has_comment = True
-                self.comments = html_comments + js_comments
+            for comment in self.comments:
+                if not is_sensitive(comment):
+                    continue
+                self.sensitive_comments.append(comment)
+                for match in SENSITIVE_PATTERN.finditer(comment):
+                    key = match.group(1)
+                    rest = comment[match.end():].lstrip()
+                    value = ""
+                    if rest:
+                        if rest[0] in ('"', "'"):
+                            end_index = rest.find(rest[0], 1)
+                            if end_index != -1:
+                                value = rest[1:end_index].strip()
+                        else:
+                            value_match = re.match(r"([^\s,<>'\"()\[\]{}]+)", rest)
+                            if value_match:
+                                value = value_match.group(1).strip()
+                    if value:
+                        self.sensitive_matches.append(f"{key}={value}")
 
-                # Check for sensitive keywords in comments
-                for comment in self.comments:
-                    if is_sensitive(comment):
-                        self.sensitive_comments.append(comment)
-                        try:
-                            # collect exact matches like "api: value" or "password = xxx"
-                            for m in SENSITIVE_PATTERN.finditer(comment):
-                                key = m.group(1)
-                                # Extract the value right after the pattern
-                                value = ""
-                                try:
-                                    rest = comment[m.end():]
-                                    # skip whitespace
-                                    rest = rest.lstrip()
-                                    if rest:
-                                        if rest[0] in ('"', "'"):
-                                            q = rest[0]
-                                            end_idx = rest.find(q, 1)
-                                            if end_idx != -1:
-                                                value = rest[1:end_idx].strip()
-                                        else:
-                                            # capture until whitespace or strong delimiters (keep symbols like #)
-                                            mval = re.match(r"([^\s,<>'" + '"' + r"()\[\]{}]+)", rest)
-                                            if mval:
-                                                value = mval.group(1).strip()
-                                except Exception:
-                                    value = ""
+            self.sensitive_comments = list(dict.fromkeys(self.sensitive_comments))
+            self.sensitive_matches = list(dict.fromkeys(self.sensitive_matches))
 
-                                if value:
-                                    self.sensitive_matches.append(f"{key}={value}")
-                        except Exception:
-                            pass
-
-                if html_comments and js_comments:
-                    self.comment_type = "Has HTML + JS Comment"
-                elif html_comments:
-                    self.comment_type = "Has HTML Comment"
-                elif js_comments:
-                    self.comment_type = "Has JS Comment"
-
-                # De-duplicate matches while preserving order
-                if self.sensitive_matches:
-                    self.sensitive_matches = list(dict.fromkeys(self.sensitive_matches))
-
-                # Detect version numbers and IPs across URL, parameters, buttons, hidden and comments
-                try:
-                    scan_pieces = [self.url]
-                    scan_pieces.extend(self.parameters)
-                    scan_pieces.extend(self.buttons)
-                    scan_pieces.extend(self.hidden_params)
-                    scan_pieces.extend(self.comments)
-                    scan_text = "\n".join(str(p) for p in scan_pieces if p)
-
-                    versions = VERSION_PATTERN.findall(scan_text)
-                    ips = IP_PATTERN.findall(scan_text)
-
-                    if versions:
-                        self.version_matches = list(dict.fromkeys(versions))
-                    if ips:
-                        self.ip_matches = list(dict.fromkeys(ips))
-                except Exception:
-                    pass
-
-
-        except Exception as e:
-            self.has_comment = False
-            self.comment_type = ""
+            scan_pieces = [self.url, self.html_content]
+            scan_pieces.extend(self.parameters)
+            scan_pieces.extend(self.buttons)
+            scan_pieces.extend(self.hidden_params)
+            scan_text = "\n".join(str(piece) for piece in scan_pieces if piece)
+            self.ip_matches = list(dict.fromkeys(IP_PATTERN.findall(scan_text)))
+            version_scan_text = IP_PATTERN.sub('', scan_text)
+            self.version_matches = list(dict.fromkeys(VERSION_PATTERN.findall(version_scan_text)))
+        except (TypeError, ValueError, re.error) as error:
+            if self.debug:
+                print(f"[DEBUG] Comment analysis error for {self.url}: {error}")
 
         return self.has_comment
 
@@ -1202,8 +1220,31 @@ def main():
                      help="Enable subdomain crawling (default: disabled)")
     parser.add_option("--debug", dest="debug", action="store_true", default=False,
                      help="Enable debug output")
-    (options, args) = parser.parse_args()
-    
+    parser.add_option("--delay", dest="delay", type="float", default=0.1,
+                     help="Delay before each request in seconds (default: 0.1)")
+    parser.add_option("--timeout", dest="timeout", type="float", default=10.0,
+                     help="Read timeout in seconds (default: 10)")
+    parser.add_option("--retries", dest="retries", type="int", default=1,
+                     help="Attempts per URL after timeout/network errors (default: 1)")
+    parser.add_option("--no-https-fallback", dest="https_fallback", action="store_false",
+                     default=True, help="Do not try HTTPS when an HTTP request fails")
+    parser.add_option("--max-size", dest="max_size", type="float", default=1.0,
+                     help="Maximum HTML response size in MiB (default: 1)")
+    (options, _args) = parser.parse_args()
+
+    if not math.isfinite(options.delay) or options.delay < 0:
+        parser.error("--delay must be a finite number greater than or equal to 0")
+    if not math.isfinite(options.timeout) or options.timeout <= 0:
+        parser.error("--timeout must be a finite number greater than 0")
+    if not math.isfinite(options.max_size) or options.max_size <= 0:
+        parser.error("--max-size must be a finite number greater than 0")
+    if options.threads <= 0:
+        parser.error("--threads must be greater than 0")
+    if options.retries <= 0:
+        parser.error("--retries must be greater than 0")
+    if options.max_urls is not None and options.max_urls <= 0:
+        parser.error("--max-urls must be greater than 0")
+
     output_file = options.output
     json_file = options.json_output
     base_url = options.base_url
@@ -1211,19 +1252,34 @@ def main():
     threads = options.threads
     crawl_subdomains = options.subdomains
     debug = options.debug
+    delay = options.delay
+    request_timeout = options.timeout
+    request_retries = options.retries
+    max_response_bytes = max(1024, int(options.max_size * 1024 * 1024))
 
     # Validate required parameters
     if not base_url:
         print(Fore.RED + "Error: Base URL is required. Use -u or --url option.")
-        print("Example: python deepseek_project.py -u https://example.com")
+        print("Example: python paracrawler.py -u https://example.com")
         return
+
+    print_color_legend()
 
     endpoints = []
     start_time = time.time()
     total_crawled = 0
     
     try:
-        crawler = AdvancedCrawler(max_workers=threads, crawl_subdomains=crawl_subdomains, debug=debug)
+        crawler = AdvancedCrawler(
+            max_workers=threads,
+            delay_range=(delay, delay),
+            crawl_subdomains=crawl_subdomains,
+            debug=debug,
+            request_timeout=request_timeout,
+            max_response_bytes=max_response_bytes,
+            request_retries=request_retries,
+            https_fallback=options.https_fallback,
+        )
         
         # First pass: crawl all URLs
         for url in crawler.run_crawler(base_url, max_urls):
@@ -1235,7 +1291,7 @@ def main():
             html_content = crawler.url_content_map.get(url)
             ep = None
             if html_content is not None and html_content != '':
-                ep = Endpoint(url, html_content)
+                ep = Endpoint(url, html_content, debug=debug)
                 ep.fetch_parameters()
                 ep.fetch_comments()
                 endpoints.append(ep)
@@ -1288,9 +1344,6 @@ def main():
         
         total_crawled = crawler.crawled_count
         
-        # Retry failed URLs
-        crawler.retry_failed_urls(endpoints)
-
         # Summary output
         end_time = time.time()
         total_time = end_time - start_time
@@ -1388,7 +1441,7 @@ def main():
                     
                     print(Fore.GREEN + f"\nSuccessfully wrote to {output_file}\n")
             except Exception as e:
-                print(Fore.RED + f"\nError writing to CSV: {str(e)}\n")
+                print(Fore.RED + f"\nError writing to CSV: {e!s}\n")
 
         # Optional JSON output
         if json_file:
@@ -1429,7 +1482,7 @@ def main():
 
                 print(Fore.GREEN + f"\nSuccessfully wrote JSON to {json_file}\n")
             except Exception as e:
-                print(Fore.RED + f"\nError writing JSON: {str(e)}\n")
+                print(Fore.RED + f"\nError writing JSON: {e!s}\n")
 
     except KeyboardInterrupt:
         print("\n[!] Stopping...")
