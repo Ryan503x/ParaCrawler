@@ -39,6 +39,13 @@ python -m pip install -r requirements.txt
 python paracrawler.py -u https://example.com
 ```
 
+
+### تضمين النطاقات الفرعية
+
+```bash
+python paracrawler.py -u https://example.com --subdomains
+```
+
 حفظ النتائج بصيغة CSV:
 
 ```bash
@@ -62,14 +69,6 @@ python paracrawler.py -u https://example.com -o results.csv
 | — | `--subdomains` | السماح بالزحف إلى النطاقات الفرعية التابعة للنطاق نفسه | معطل |
 | — | `--debug` | عرض معلومات تفصيلية تساعد في التشخيص | معطل |
 
-
-## أمثلة عملية
-
-### تضمين النطاقات الفرعية
-
-```bash
-python paracrawler.py -u https://example.com --subdomains
-```
 
 
 
