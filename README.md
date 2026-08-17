@@ -17,6 +17,7 @@
 - أرقام الإصدارات.
 - عناوين IPv4.
 - الملفات المكتشفة.
+- الروابط الموجودة خارج نطاق الزحف (تُحفظ وتُعرض دون زيارتها).
 
 ## التثبيت
 
@@ -51,6 +52,9 @@ python paracrawler.py -u https://example.com --subdomains
 ```bash
 python paracrawler.py -u https://example.com -o results.csv
 ```
+
+يتضمن ملخص الطرفية وملفا CSV وJSON الروابط المكتشفة خارج النطاق تحت قسم
+`Out-of-Scope Links (Not Visited)`؛ تحفظ الأداة هذه الروابط فقط ولا ترسل إليها طلبات.
 
 ## خيارات سطر الأوامر
 

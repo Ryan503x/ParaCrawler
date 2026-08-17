@@ -64,8 +64,8 @@ TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
 def print_color_legend():
     """Print the result color legend once at startup."""
     print("\nResult color legend:")
-    print(Fore.LIGHTMAGENTA_EX + "  Query parameters" + Style.RESET_ALL)
-    print(Fore.LIGHTBLUE_EX + "  HTML inputs" + Style.RESET_ALL)
+    print(Fore.LIGHTMAGENTA_EX + "  Query parameters (GET Parameters)" + Style.RESET_ALL)
+    print(Fore.LIGHTBLUE_EX + "  HTML inputs (POST Parameters)" + Style.RESET_ALL)
     print(Fore.YELLOW + "  JavaScript inputs" + Style.RESET_ALL)
     print(Fore.GREEN + "  Buttons" + Style.RESET_ALL)
     print(Fore.LIGHTBLACK_EX + "  Hidden fields" + Style.RESET_ALL)
@@ -243,6 +243,9 @@ class AdvancedCrawler:
         self.url_status = {}  # HTTP status per URL
         self.failed_urls = set()
         self.timeout_urls = set()  # URLs that timed out
+        # HTTP(S) links discovered outside the configured crawl scope. These
+        # are reported only and are never added to the crawl queue.
+        self.out_of_scope_links = set()
         self.base_domain = ""
         self.domain_ip = None  # Store resolved IP
         self.max_workers = max(1, int(max_workers))
@@ -365,6 +368,22 @@ class AdvancedCrawler:
         except (TypeError, ValueError, AttributeError):
             return url
 
+    def record_out_of_scope_link(self, url):
+        """Retain a normalized external HTTP(S) URL without visiting it."""
+        link = self.normalize_url(url)
+        try:
+            parsed = urlparse(link)
+            if (
+                parsed.scheme.lower() in ('http', 'https')
+                and parsed.hostname
+                and not self.is_same_domain(link)
+            ):
+                self.out_of_scope_links.add(link)
+                return True
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return False
+
     def is_non_html_resource(self, url):
         """Return True for resources we don't want to crawl (pdf/images/archives)."""
         lower = url.lower()
@@ -406,6 +425,8 @@ class AdvancedCrawler:
 
             next_url = self.normalize_url(urljoin(current_url, location))
             if not self.is_same_domain(next_url):
+                with self.lock:
+                    self.record_out_of_scope_link(next_url)
                 return response, current_url, False
 
             response.close()
@@ -674,7 +695,7 @@ class AdvancedCrawler:
                 if self.is_same_domain(link) and link not in self.visited and link not in self.to_visit:
                     self.to_visit.append(link)
                     new_links.append(link)
-                elif link not in self.visited and link not in self.to_visit:
+                elif self.record_out_of_scope_link(link):
                     if self.debug:
                         parsed = urlparse(link)
                         print(f"[DEBUG] Rejected link (domain mismatch): {link} (domain: {parsed.netloc}, base: {self.base_domain})")
@@ -687,6 +708,7 @@ class AdvancedCrawler:
         self.to_visit.clear()
         self.failed_urls.clear()
         self.timeout_urls.clear()
+        self.out_of_scope_links.clear()
         self.crawled_count = 0
         
         if not start_url.startswith(('http://', 'https://')):
@@ -1348,6 +1370,12 @@ def main():
         end_time = time.time()
         total_time = end_time - start_time
 
+        print("["+ Fore.CYAN + "+", end="")
+        print("]",end="")
+        print(f"Out-of-scope links (not visited): {len(crawler.out_of_scope_links)} URLs.")
+        for external_url in sorted(crawler.out_of_scope_links):
+            print(Fore.LIGHTBLACK_EX + f"  {external_url}" + Style.RESET_ALL)
+
         print("-"*50)
         print("["+ Fore.GREEN + "+", end="")
         print("]",end="")
@@ -1373,7 +1401,10 @@ def main():
         if output_file:
             try:
                 with open(output_file, "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig for Excel compatibility
-                    writer = csv.writer(f, delimiter=',')
+                    # Quote every field so spreadsheet importers never treat
+                    # URL punctuation (especially the colon in http://) as a
+                    # column separator.
+                    writer = csv.writer(f, delimiter=',', quoting=csv.QUOTE_ALL)
                     writer.writerow([
                         "URL",
                         "Query_Params",
@@ -1438,6 +1469,13 @@ def main():
                         writer.writerow(["Failed URLs (404s):"])
                         for failed_url in sorted(crawler.failed_urls):
                             writer.writerow([failed_url, "", "", "", "", "", "", "", ""])
+
+                    # External links are discoveries only: they were never fetched.
+                    if crawler.out_of_scope_links:
+                        writer.writerow([])
+                        writer.writerow(["Out-of-Scope Links (Not Visited):"])
+                        for external_url in sorted(crawler.out_of_scope_links):
+                            writer.writerow([external_url, "", "", "", "", "", "", "", ""])
                     
                     print(Fore.GREEN + f"\nSuccessfully wrote to {output_file}\n")
             except Exception as e:
@@ -1475,6 +1513,7 @@ def main():
                     "found_files": sorted(crawler.found_files) if crawler.found_files else [],
                     "failed_urls_404": sorted(crawler.failed_urls) if crawler.failed_urls else [],
                     "timeout_urls": sorted(crawler.timeout_urls) if crawler.timeout_urls else [],
+                    "out_of_scope_links_not_visited": sorted(crawler.out_of_scope_links) if crawler.out_of_scope_links else [],
                 }
 
                 with open(json_file, "w", encoding="utf-8-sig") as jf:  # utf-8-sig for better Arabic support
