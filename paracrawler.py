@@ -133,6 +133,97 @@ def registered_domain(host):
     return _fallback_registered_domain(host)
 
 
+# Percent-encoding triplets should use uppercase hex ("%2f" -> "%2F") so two
+# spellings of the same URL collapse to one during de-duplication.
+_PCT_ENCODING = re.compile(r'%[0-9a-fA-F]{2}')
+
+
+def _normalize_pct_encoding(text):
+    """Uppercase the hex digits in every percent-encoded triplet."""
+    return _PCT_ENCODING.sub(lambda m: m.group(0).upper(), text)
+
+
+def _remove_dot_segments(path):
+    """Resolve "." and ".." path segments per RFC 3986 section 5.2.4.
+
+    Turns "/a/./b/../c" into "/a/c" so equivalent paths crawl only once and
+    directory traversal in a link cannot escape above the root.
+    """
+    if not path:
+        return path
+    leading_slash = path.startswith('/')
+    trailing_slash = path.endswith('/') and len(path) > 1
+    out = []
+    for segment in path.split('/'):
+        if segment == '' or segment == '.':
+            continue
+        if segment == '..':
+            if out:
+                out.pop()
+            continue
+        out.append(segment)
+    resolved = '/'.join(out)
+    if leading_slash:
+        resolved = '/' + resolved
+    if trailing_slash and not resolved.endswith('/'):
+        resolved += '/'
+    return resolved or ('/' if leading_slash else '')
+
+
+def normalize_proxy(proxy):
+    """Turn a --proxy value into a requests-style {'http':.., 'https':..} dict.
+
+    Accepts bare "host:port" (assumed http, e.g. Burp/ZAP at 127.0.0.1:8080),
+    a full "http://user:pass@host:port" URL, or a scheme requests understands
+    (http/https/socks5/socks5h/socks4). Returns None for empty input and
+    raises ValueError on something that cannot be a proxy.
+    """
+    if not proxy:
+        return None
+    proxy = proxy.strip()
+    if not proxy:
+        return None
+
+    if '://' in proxy:
+        parsed = urlparse(proxy)
+        scheme = parsed.scheme.lower()
+        if not parsed.hostname:
+            raise ValueError(f"invalid --proxy '{proxy}': missing host")
+        if scheme in ('socks5', 'socks5h', 'socks4', 'socks4a'):
+            # A single SOCKS proxy handles both http and https targets.
+            return {'http': proxy, 'https': proxy}
+        if scheme not in ('http', 'https'):
+            raise ValueError(f"invalid --proxy '{proxy}': unsupported scheme '{scheme}'")
+        return {'http': proxy, 'https': proxy}
+
+    # Bare "host:port" (or "user:pass@host:port"): default to an HTTP proxy,
+    # which is what intercepting proxies expose for both HTTP and HTTPS.
+    url = f'http://{proxy}'
+    parsed = urlparse(url)
+    if not parsed.hostname or parsed.port is None:
+        raise ValueError(f"invalid --proxy '{proxy}': expected host:port")
+    return {'http': url, 'https': url}
+
+
+def load_seed_urls(path):
+    """Read seed URLs from a file: one URL per line.
+
+    Blank lines and lines beginning with '#' (treated as comments) are skipped.
+    Returns the URLs in file order with duplicates removed. Propagates OSError
+    if the file cannot be opened or read so the caller can report it.
+    """
+    seeds = []
+    # utf-8-sig transparently strips a leading BOM, matching the encoding used
+    # for the crawler's own output files.
+    with open(path, 'r', encoding='utf-8-sig') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            seeds.append(line)
+    return list(dict.fromkeys(seeds))
+
+
 def print_color_legend():
     """Print the result color legend once at startup."""
     print("\nResult color legend:")
@@ -165,10 +256,57 @@ SENSITIVE_KEYWORDS = [
     'authkey', 'auth_key', 'password_reset_token'
 ]
 
+# Keyword match must sit on a word boundary so "pass" does not fire inside
+# "passenger" / "compass" and "key" not inside "monkey". The trailing group
+# allows an optional quote before the ":"/"=" so JSON/JS ("api_key":) and
+# query-string ("token=") forms both match.
 SENSITIVE_PATTERN = re.compile(
-    r'(' + '|'.join(re.escape(k) for k in SENSITIVE_KEYWORDS) + r')[\s_-]*[:=]',
+    r'\b(' + '|'.join(re.escape(k) for k in SENSITIVE_KEYWORDS) + r')\b'
+    r'["\']?\s*[:=]',
     re.IGNORECASE
 )
+
+# High-signal credential formats. Unlike SENSITIVE_PATTERN these match the
+# secret *value* itself, so they fire even with no nearby keyword. Each entry
+# is (label, compiled-regex); the label is reported alongside the match.
+SECRET_PATTERNS = [
+    ('private_key', re.compile(
+        r'-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----')),
+    ('jwt', re.compile(
+        r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}')),
+    ('aws_access_key_id', re.compile(r'\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b')),
+    ('aws_secret_access_key', re.compile(
+        r'(?i)aws[_-]?secret[_-]?access[_-]?key["\']?\s*[:=]\s*["\']?([A-Za-z0-9/+=]{40})')),
+    ('google_api_key', re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b')),
+    ('github_token', re.compile(r'\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{22,}\b')),
+    ('slack_token', re.compile(r'\bxox[baprs]-[0-9A-Za-z-]{10,}\b')),
+    ('slack_webhook', re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9_/]+')),
+    ('stripe_key', re.compile(r'\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{16,}\b')),
+    ('bearer_token', re.compile(r'\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*')),
+    ('basic_auth', re.compile(r'\bBasic\s+[A-Za-z0-9+/]{16,}={0,2}')),
+    ('authorization_url', re.compile(r'https?://[^\s:@/]+:[^\s:@/]+@[^\s/]+')),
+]
+
+
+def find_secrets(text):
+    """Return a de-duplicated list of 'label=value' credential findings.
+
+    Scans the raw text for known high-entropy secret formats. Values are
+    truncated so a giant blob (e.g. a full JWT) stays readable in the report.
+    """
+    if not text:
+        return []
+    findings = []
+    for label, pattern in SECRET_PATTERNS:
+        for match in pattern.finditer(text):
+            # Prefer an explicit capture group (the secret value) when the
+            # pattern defines one; otherwise use the whole match.
+            value = match.group(match.lastindex) if match.lastindex else match.group(0)
+            value = value.strip()
+            if len(value) > 80:
+                value = value[:77] + '...'
+            findings.append(f"{label}={value}")
+    return list(dict.fromkeys(findings))
 
 # Version number pattern (strict, avoids IPv4 addresses)
 # Matches sequences like 1.2.3, 10.4.12, 1.2.3-alpha, etc.,
@@ -198,6 +336,11 @@ def is_sensitive(text):
 
     if INPUT_FIELD_PATTERN.search(text):
         return bool(INPUT_FIELD_WITH_VALUE_PATTERN.search(text))
+
+    # A recognized credential format is sensitive on its own, regardless of
+    # any surrounding keyword.
+    if any(pattern.search(text) for _label, pattern in SECRET_PATTERNS):
+        return True
 
     # Check for sensitive pattern
     match = SENSITIVE_PATTERN.search(text)
@@ -308,6 +451,7 @@ class AdvancedCrawler:
         request_retries=1,
         https_fallback=True,
         extra_headers=None,
+        proxies=None,
     ):
         self.visited = set()
         self.to_visit = deque()
@@ -334,6 +478,9 @@ class AdvancedCrawler:
         # Authenticated-session headers (Cookie, Authorization, custom headers).
         # Applied to every thread-local session so all requests share the auth.
         self.extra_headers = dict(extra_headers) if extra_headers else {}
+        # Optional upstream proxy (e.g. Burp/ZAP). Same dict is shared across
+        # every thread-local session so all traffic is routed through it.
+        self.proxies = dict(proxies) if proxies else None
 
         self._thread_local = threading.local()
         # Cooperative cancellation flag. Set on Ctrl+C (or when a URL limit is
@@ -361,6 +508,11 @@ class AdvancedCrawler:
         # Authorization / User-Agent overrides the defaults above.
         if self.extra_headers:
             session.headers.update(self.extra_headers)
+        # Route through the configured proxy and ignore ambient HTTP(S)_PROXY
+        # env vars so the crawl target is deterministic.
+        if self.proxies:
+            session.proxies.update(self.proxies)
+            session.trust_env = False
         session.verify = False
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=self.max_workers,
@@ -441,17 +593,34 @@ class AdvancedCrawler:
             if ':' in host and not host.startswith('['):
                 host = f'[{host}]'
 
+            # Preserve credentials embedded in the authority (user:pass@host) so
+            # an authenticated link is not silently stripped of its auth.
+            userinfo = ''
+            if parsed.username is not None:
+                userinfo = parsed.username
+                if parsed.password is not None:
+                    userinfo += f':{parsed.password}'
+                userinfo += '@'
+
             port = parsed.port
             if port and not ((scheme == 'http' and port == 80) or (scheme == 'https' and port == 443)):
                 host = f'{host}:{port}'
 
+            # Collapse repeated slashes, resolve ./.. segments, then trim a
+            # trailing slash so "/a//b/", "/a/b" and "/a/c/../b" all agree.
             path = re.sub(r'/+', '/', parsed.path or '/')
+            path = _remove_dot_segments(path)
+            if not path:
+                path = '/'
             if path != '/' and path.endswith('/'):
                 path = path.rstrip('/')
+            path = _normalize_pct_encoding(path)
 
-            normalized = f'{scheme}://{host}{path}'
+            normalized = f'{scheme}://{userinfo}{host}{path}'
             if parsed.query:
-                normalized += f'?{parsed.query}'
+                # Fragments are dropped (never sent to the server); normalize
+                # only the encoding case of the query string.
+                normalized += f'?{_normalize_pct_encoding(parsed.query)}'
             return normalized
         except (TypeError, ValueError, AttributeError):
             return url
@@ -798,7 +967,7 @@ class AdvancedCrawler:
         
         return url, new_links
 
-    def run_crawler(self, start_url, max_urls=None):
+    def run_crawler(self, start_url, max_urls=None, seed_urls=None):
         """Main crawler function with optional limits - IMPROVED"""
         self.visited.clear()
         self.to_visit.clear()
@@ -836,6 +1005,26 @@ class AdvancedCrawler:
         else:
             print(f"Starting crawl of {start_url}")
         print(f"[INFO] Root domain: {self.root_domain}")
+
+        # Seed the frontier with URLs imported from a file. Each is normalized
+        # and queued only if it falls inside the crawl scope; out-of-scope seeds
+        # are recorded (and later reported) but never crawled, exactly as links
+        # discovered on a page are handled.
+        if seed_urls:
+            added = 0
+            skipped = 0
+            for raw_seed in seed_urls:
+                seed = self.normalize_url(raw_seed)
+                if self.is_same_domain(seed):
+                    if seed != start_url and seed not in self.to_visit:
+                        self.to_visit.append(seed)
+                        added += 1
+                else:
+                    self.record_out_of_scope_link(seed)
+                    skipped += 1
+            print(f"[INFO] Imported {added} in-scope seed URL(s) from file"
+                  + (f" ({skipped} out-of-scope, not queued)" if skipped else ""))
+
         print("-"*50)
 
         # Rolling-submission scheduler.
@@ -1332,6 +1521,13 @@ class Endpoint:
                     if value:
                         self.sensitive_matches.append(f"{key}={value}")
 
+            # Scan the whole page (not just comments) for known credential
+            # formats: leaked API keys, JWTs, private keys, basic-auth URLs, etc.
+            secret_findings = find_secrets(self.url)
+            secret_findings.extend(find_secrets(self.html_content))
+            if secret_findings:
+                self.sensitive_matches.extend(secret_findings)
+
             self.sensitive_comments = list(dict.fromkeys(self.sensitive_comments))
             self.sensitive_matches = list(dict.fromkeys(self.sensitive_matches))
 
@@ -1355,6 +1551,12 @@ def main():
     parser.add_option("-o", "--output", dest="output", help="Save results to CSV file", metavar="FILE")
     parser.add_option("-j", "--json-output", dest="json_output", help="Save results to JSON file", metavar="FILE")
     parser.add_option("-u", "--url", dest="base_url", help="Base URL to crawl")
+    parser.add_option("-i", "--import", "--urls-file", dest="urls_file", default=None,
+                     metavar="FILE",
+                     help="Import seed URLs from a file (one URL per line; blank "
+                          "lines and lines starting with '#' are ignored) and add "
+                          "the in-scope ones to the crawl queue. If -u/--url is "
+                          "omitted, the first imported URL is used as the base.")
     parser.add_option("-m", "--max-urls", dest="max_urls", type="int", default=None,
                      help="Maximum number of URLs to crawl (optional)")
     parser.add_option("-t", "--threads", dest="threads", type="int", default=10,
@@ -1384,6 +1586,10 @@ def main():
                      metavar="HEADER",
                      help="Extra request header as 'Name: Value' (repeatable), "
                           "e.g. -H 'X-Api-Key: 123'")
+    parser.add_option("--proxy", dest="proxy", default=None, metavar="PROXY",
+                     help="Route all traffic through a proxy (e.g. Burp/ZAP): "
+                          "--proxy 127.0.0.1:8080, --proxy http://user:pass@127.0.0.1:8080, "
+                          "or --proxy socks5h://127.0.0.1:9050")
     (options, _args) = parser.parse_args()
 
     if not math.isfinite(options.delay) or options.delay < 0:
@@ -1426,11 +1632,37 @@ def main():
             parser.error(f"invalid --header '{raw}'. Header name is empty.")
         extra_headers[name] = value
 
+    # Resolve the optional upstream proxy.
+    proxies = None
+    if options.proxy:
+        try:
+            proxies = normalize_proxy(options.proxy)
+        except ValueError as error:
+            parser.error(str(error))
+
+    # Load seed URLs imported from a file (if any) before validating the base
+    # URL, so an imported list can supply the base when -u is omitted.
+    seed_urls = []
+    if options.urls_file:
+        try:
+            seed_urls = load_seed_urls(options.urls_file)
+        except OSError as error:
+            parser.error(f"could not read --import file '{options.urls_file}': {error}")
+        if not seed_urls:
+            parser.error(f"no URLs found in --import file '{options.urls_file}'")
+
     # Validate required parameters
     if not base_url:
-        print(Fore.RED + "Error: Base URL is required. Use -u or --url option.")
-        print("Example: python paracrawler.py -u https://example.com")
-        return
+        if seed_urls:
+            base_url = seed_urls[0]
+            print(Fore.CYAN + f"[INFO] No -u/--url given; using first imported URL "
+                              f"as base: {base_url}" + Style.RESET_ALL)
+        else:
+            print(Fore.RED + "Error: Base URL is required. Use -u/--url, or import "
+                             "a URL list with -i/--import.")
+            print("Example: python paracrawler.py -u https://example.com")
+            print("Example: python paracrawler.py -i urls.txt")
+            return
 
     print_color_legend()
 
@@ -1449,14 +1681,17 @@ def main():
             request_retries=request_retries,
             https_fallback=options.https_fallback,
             extra_headers=extra_headers or None,
+            proxies=proxies,
         )
         if extra_headers:
             print(Fore.CYAN + f"[INFO] Authenticated session: sending {', '.join(sorted(extra_headers))} header(s)" + Style.RESET_ALL)
+        if proxies:
+            print(Fore.CYAN + f"[INFO] Routing traffic through proxy: {proxies.get('http')}" + Style.RESET_ALL)
         
         # First pass: crawl all URLs.
         # A Ctrl+C here stops the crawl promptly but still falls through to the
         # summary and CSV/JSON output so partial results are never lost.
-        crawl_generator = crawler.run_crawler(base_url, max_urls)
+        crawl_generator = crawler.run_crawler(base_url, max_urls, seed_urls=seed_urls)
         try:
           for url in crawl_generator:
             status = crawler.url_status.get(url)
